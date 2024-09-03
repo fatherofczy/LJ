@@ -1,0 +1,11 @@
+hidden_size: 256
+row: 8
+col: 8
+num_layers: 1
+dropout: 0.2
+type: 'class'
+freq_size: 5
+C: 170
+L: 64
+N: 3759
+experts: 10
