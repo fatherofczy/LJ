@@ -1,0 +1,4 @@
+tau: 1
+num_states: 5
+src_info: 'LR_TPE'
+hidden_size: 128
