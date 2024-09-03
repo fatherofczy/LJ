@@ -1,0 +1,98 @@
+backtest:
+  eps: 1.0e-06
+  metrics:
+    - ic
+    - rank_ic
+    - ls_ret
+    - g_rets
+  n_groups: 5
+  n_thresh: 100
+  pct_l: 0.2
+  pct_s: 0.2
+  scale: 10000
+
+data:
+  clip: null
+  extending: false
+  partition:
+    - '20181231'
+    - '20200701'
+    - '20200816'
+    - '20200930'
+  sequence: false
+  stocknum: 3759
+  x_skip:
+    - 238
+    - 239
+  y_skip:
+    - 238
+    - 239
+    - 240
+
+model:
+  base_params:
+    active_fn: relu
+    dropout: 0.2
+    embed_dim: 64
+    eps: 1.0e-06
+    ff_shape: 256
+    norm_first: false
+    norm_shape: 64
+    num_heads: 2
+    num_layers: 2
+  input_shape:
+    C: 170
+    L: 64
+    N: 3759
+  name: big_stack_witran_equal_loss
+  type: base
+version: '1'
+writer: /dfs/data/log/output_switch_witran
+
+optim:
+  anneal_eta_min: 5.0e-05
+  anneal_start: 3
+  betas:
+    - 0.9
+    - 0.95
+  ddp: true
+  enable_valid: true
+  epochs: 5
+  fused: false
+  lr: 0.0001
+  num_workers: 12
+  seed: 42
+  sub_epochs: 5
+  train_batch_size: 1
+  valid_batch_size: 1
+  warmup_base: 10
+  warmup_end: 1
+  weight_decay: 0.01
+
+prep:
+  by_parts:
+    curr_part: 1
+    n_parts: 100
+  date_range:
+    - '20181231'
+    - '20200930'
+  freq:
+    minutes: 1
+  intervals:
+    - '093000'
+    - '113000'
+    - '130100'
+    - '150000'
+
+path:
+  dir_save: /dfs/dataset/170346323992/
+  dir_scan: /dfs/dataset/10-1704454471157/data/data_norm/t1/
+  dir_x: /dfs/dataset/10-1704454471157/data/data_norm/t1/
+  dir_y: /dfs/dataset/10-1704454471157/data/data_norm/label/
+
+processes: 100
+save_suffix: ''
+
+scheme:
+  meta: false
+  type: switch
