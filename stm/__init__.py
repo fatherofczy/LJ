@@ -20,3 +20,5 @@ class EncoderPipeline(Pipeline):
 
     def prep_eval(self, data: tuple) -> torch.Tensor:
         return super().prep_eval(data)
+
+

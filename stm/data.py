@@ -1,16 +1,14 @@
 import warnings
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn
 import yaml
-import datetime
-from pathos.multiprocessing import ProcessingPool
+# from pathos.multiprocessing import ProcessingPool
 from torch.utils.data import Dataset
 from tqdm import tqdm
-
-from ..utils import Directory, get_dates, get_times, np_ffill
+import datetime
+from .utils import Directory, get_dates, get_times, np_ffill
 
 warnings.filterwarnings("ignore")
 
@@ -140,6 +138,8 @@ class Preprocessor:
                     df_y = df_ticker.merge(df_y, "left", "ticker")
                     yy = df_y[y_col].values
                     ss = (df_y["isZT"].values == 1) | (df_y["isDT"].values == 1)
+#                     xx = (xx - np.nanmean(xx, axis=0)) / (np.nanstd(xx, axis=0) + 1e-6)  # 截面标准化
+#                     yy = yy - np.nanmean(yy, axis=0) 
                 except Exception as e:
                     print(e)
                     xx = np.full((len(self.tickers), len(x_cols)), np.nan)
@@ -165,6 +165,7 @@ class Preprocessor:
             x = x.astype(np.float32, copy=False)
             y = y.astype(np.float32, copy=False)
             # write
+            block=64*1024
             with open(self.dir_save + f"x_{d}.dat", "wb") as f:
                 for j in range(len(x)):  # since x is too large
                     f.write(x[j].tobytes())
@@ -180,8 +181,9 @@ class Preprocessor:
                 f.flush()
 
         # clean data by parts and by multiprocessing
-        idx_l = len(self.dates) * (self.curr_part - 1) // self.n_parts
-        idx_r = len(self.dates) * self.curr_part // self.n_parts
+#         idx_l = len(self.dates) * (self.curr_part - 1) // self.n_parts
+#         idx_r = len(self.dates) * self.curr_part // self.n_parts
+#         helper(self.dates[0])
         with ProcessingPool(nodes=self.processes) as p:
             p.map(helper, self.dates)
         # save data info
@@ -194,6 +196,100 @@ class Preprocessor:
             x_cols=x_cols,
             y_col=y_col,
         )
+
+class StockMmapDataset(Dataset):
+    """Dataset based on memory-mapped files"""
+
+    def __init__(
+        self,
+        data_path: str,
+        dates: list,
+        times: list,
+        N: int,
+        L: int,
+        C: int,
+        stocknum:int,
+        start:int,
+        end:int,
+        x_keep: list = None,
+        y_keep: list = None,
+        clip: list = None,
+        extending: bool = False,
+        sequence:bool=False,
+        time_range:list=None,
+        **args
+    ) -> None:
+
+        self.data_path = data_path
+        self.dates, self.times = dates, times
+        self.N, self.L, self.C = N, L, C
+        self.stocknum=stocknum
+        self.groupnum=int(np.ceil(self.N/stocknum))
+        self.x_keep = list(range(len(times))) if x_keep is None else x_keep
+        self.y_keep = list(range(len(times))) if y_keep is None else y_keep
+        self.time_range=list(range(len(y_keep))) if time_range is None else time_range
+        self.S = len(self.time_range)  # number of valid labels per day
+        self.index_base = self.L // self.S + 1  # the first valid date index
+        self.clip = clip
+        self.extending = extending
+        self.sequence=sequence
+        
+#         self.x=np.memmap('/dfs/data/data/cat/x.dat',mode='r',dtype=np.float32,shape=(427,238,3759,170))[start:end,self.time_range]
+#         self.y=np.memmap('/dfs/data/data/cat/y.dat',mode='r',dtype=np.float32,shape=(427,238,3759))[start:end,self.time_range]
+#         self.i=np.memmap('/dfs/data/data/cat/i.dat',mode='r',dtype=np.bool_,shape=(427,238,3759))[start:end,self.time_range]
+#         self.p=np.memmap('/dfs/data/data/cat/p.dat',mode='r',dtype=np.bool_,shape=(427,3759))
+    def __len__(self) -> int:
+        # make sure that we start from a day with enough lookback data
+        return (len(self.dates) - self.index_base) * (1 if self.extending else self.S)*self.groupnum
+    def __getitem__(self, index: int) -> tuple:
+        # extending window
+       
+        # get index for date and time
+        time,group=index//self.groupnum,index%self.groupnum
+        j, k = time // self.S + self.index_base, time % self.S
+        x=np.memmap('/dfs/data/data/cat/x.dat',mode='r',dtype=np.float32,shape=(427,238,3759,170))[start:end,self.time_range][j-self.index_base:j+1]
+        x=x.reshape(-1,*x.shape[2:])
+        stockslice=range(min(group*self.stocknum,self.N-self.stocknum),min(self.N,(1+group)*self.stocknum))
+        if k != self.S - 1:
+            x = x[: -(self.S - k - 1), :, :]  # since x only has one more 240 than y
+        # keep lookback times
+        x = x[-self.L :,stockslice,:]  # L*N*C
+        # transpose features
+        x = np.transpose(x, (1, 0, 2))  # N*L*C
+        # read labels
+        if self.sequence:
+            y=np.memmap('/dfs/data/data/cat/y.dat',mode='r',dtype=np.float32,shape=(427,238,3759))[start:end,self.time_range][j-self.index_base:j+1]
+            y=y.reshape(-1,*y.shape[2:])
+            if k!=self.S-1:
+                y = y[: -(self.S - k - 1), :]
+#                 y=y[max(-(k+1),-self.L):,stockslice]
+            y=y[-self.L:,stockslice]
+            y=y.transpose(1,0)
+        # keep lookback times
+        else:
+            y=np.memmap('/dfs/data/data/cat/y.dat',mode='r',dtype=np.float32,shape=(427,238,3759))[start:end,self.time_range][j,k,stockslice]
+        # read padding mask
+        pad_mask = np.full(self.N, False)
+        for d in range(j-self.index_base,j+1):
+            pad_mask|=np.memmap('/dfs/data/data/cat/p.dat',mode='r',dtype=np.bool_,shape=(427,3759))[d]
+        ignore_index=np.memmap('/dfs/data/data/cat/i.dat',mode='r',dtype=np.bool_,shape=(427,238,3759))[start:end,self.time_range][j]
+        x = torch.from_numpy(x).float()
+        y = torch.from_numpy(y).float()
+        pad_mask = torch.from_numpy(pad_mask).bool()
+        ignore_index = torch.from_numpy(ignore_index).bool()
+        pad_mask=pad_mask[stockslice]
+        ignore_index=ignore_index[k,stockslice]
+        # clipS
+        if self.clip is not None:
+            x = x.clamp(*self.clip)
+        date=self.dates[j]
+        time=self.times[k]
+        weekday=datetime.date(int(date[:4]),int(date[4:6]),int(date[6:])).weekday()
+        time_info=torch.tensor((int(date[4:6]),int(date[6:]),weekday,int(time[:2]),int(time[2:4])))
+        time_info=time_info.unsqueeze(0).expand(self.N,5)
+        return x, y, pad_mask, ignore_index,time_info
+
+            
 class MmapDataset(Dataset):
     """Dataset based on memory-mapped files"""
 
@@ -205,11 +301,16 @@ class MmapDataset(Dataset):
         N: int,
         L: int,
         C: int,
+        start:int,
+        end:int,
+        stocknum: int,
         x_keep: list = None,
         y_keep: list = None,
         clip: list = None,
         extending: bool = False,
-        *args
+        sequence:bool=False,
+        time_range:list=None,
+        **args
     ) -> None:
         """Initialize
 
@@ -240,7 +341,8 @@ class MmapDataset(Dataset):
         self.N, self.L, self.C = N, L, C
         self.x_keep = list(range(len(times))) if x_keep is None else x_keep
         self.y_keep = list(range(len(times))) if y_keep is None else y_keep
-        self.S = len(self.y_keep)  # number of valid labels per day
+        self.time_range=self.y_keep if time_range is None else time_range
+        self.S = len(self.time_range)   # number of valid labels per day
         self.index_base = self.L // self.S + 1  # the first valid date index
         self.clip = clip
         self.extending = extending
@@ -254,6 +356,7 @@ class MmapDataset(Dataset):
             Length of dataset
         """
         # make sure that we start from a day with enough lookback data
+
         return (len(self.dates) - self.index_base) * (1 if self.extending else self.S)
 
     def __getitem__(self, index: int) -> tuple:
@@ -372,6 +475,7 @@ class MmapDataset(Dataset):
         # rolling window
         else:
             # get index for date and time
+
             j, k = index // self.S + self.index_base, index % self.S
             # read features
             x = [
@@ -384,7 +488,7 @@ class MmapDataset(Dataset):
                 for d in self.dates[j - self.index_base : j + 1]
             ]
             # keep valid times
-            x = np.concatenate([i[self.x_keep] for i in x])  # (D*T)*N*C
+            x = np.concatenate([i[self.time_range] for i in x])  # (D*T)*N*C
             # drop future times
             if k != self.S - 1:
                 x = x[: -(self.S - k - 1), :, :]  # since x only has one more 240 than y
@@ -400,7 +504,7 @@ class MmapDataset(Dataset):
                 shape=(len(self.times), self.N),
             )
             # get corresponding labels
-            y = y[self.y_keep[k], :]  # N
+            y = y[self.time_range[k], :]  # N
             # read padding mask
             pad_mask = np.full(self.N, False)  # N
             for d in self.dates[j - self.index_base : j + 1]:
@@ -418,7 +522,7 @@ class MmapDataset(Dataset):
                 shape=(len(self.times), self.N),
             )
             # get corresponding ignored index
-            ignore_index = ignore_index[self.y_keep[k], :]  # N
+            ignore_index = ignore_index[self.time_range[k], :]  # N
             # to tensor
             x = torch.from_numpy(x).float()
             y = torch.from_numpy(y).float()
@@ -427,109 +531,13 @@ class MmapDataset(Dataset):
             # clip
             if self.clip is not None:
                 x = x.clamp(*self.clip)
-            date = self.dates[j]
-            time = self.times[k]
-            weekday = datetime.date(int(date[:4]), int(date[4:6]), int(date[6:])).weekday()
-            time_info = torch.tensor([int(date[:4]), int(date[4:6]), int(date[6:]), weekday, int(time[:2]), int(time[2:4])])
-            time_info = time_info.unsqueeze(0).expand(self.N, 5)
-        
+            date=self.dates[j]
+            time=self.times[k]
+            weekday=datetime.date(int(date[:4]),int(date[4:6]),int(date[6:])).weekday()
+            time_info=torch.tensor((int(date[4:6]),int(date[6:]),weekday,int(time[:2]),int(time[2:4])))
+            time_info=time_info.unsqueeze(0).expand(self.N,5)
             return x, y, pad_mask, ignore_index,time_info
-class StockMmapDataset(Dataset):
-    """Dataset based on memory-mapped files"""
-    
-    def __init__(
-        self,
-        data_path: str,
-        dates: list,
-        times: list,
-        N: int,
-        L: int,
-        C: int,
-        stocknum: int,
-        start: int,
-        end: int,
-        x_keep: list = None,
-        y_keep: list = None,
-        clip: list = None,
-        extending: bool = False,
-        sequence: bool = False,
-        time_range: None = None
-    ) -> None:
 
-        self.data_path = data_path
-        self.dates, self.times = dates, times
-        self.N, self.L, self.C = N, L, C
-        self.stocknum = stocknum
-        self.groupnum = int(np.ceil(self.N / stocknum))
-        self.x_keep = list(range(len(times))) if x_keep is None else x_keep
-        self.y_keep = list(range(len(times))) if y_keep is None else y_keep
-        self.time_range = list(range(len(y_keep))) if time_range is not None else time_range
-        self.S = len(self.time_range)  # number of valid labels per day
-        self.index_base = self.L // self.S + 1  # the first valid date index
-        self.clip = clip
-        self.extending = extending
-        self.sequence = sequence
-
-        self.x = np.memmap('/dfs/data/data/ct/x.dat', mode='r', dtype=np.float32, shape=(427, 238, 3759, 170))[start:end, self.time_range]
-        self.y = np.memmap('/dfs/data/data/ct/y.dat', mode='r', dtype=np.float32, shape=(427, 238, 3759))[start:end, self.time_range]
-        self.i = np.memmap('/dfs/data/data/ct/i.dat', mode='r', dtype=np.bool_, shape=(427, 238, 3759))[start:end, self.time_range]
-        self.p = np.memmap('/dfs/data/data/ct/p.dat', mode='r', dtype=np.bool_, shape=(427, 3759))[start:end, self.time_range]
-
-    def __len__(self) -> int:
-        # Make sure there's enough data to form a day with lookback
-        return (len(self.dates) - self.index_base) * self.groupnum*(1 if self.extending else self.S)
-    def __getitem__(self, index: int) -> tuple:
-        # extending window
-
-        # get index for date and time
-        time, group = index // self.groupnum, index % self.groupnum
-        j, k = time // self.S + self.index_base, time % self.S
-        x = self.x[j - self.index_base:j + 1]
-        x = x.reshape(-1, *x.shape[2:])
-        stockslice = range(min(self.group * self.stocknum, self.N - self.S * self.stocknum), min(self.N, (1 + group) * self.stocknum))
-
-        if k != self.S - 1:
-            x = x[-(self.S - k - 1):, :, :]
-        # keep Lookback times
-        x = x[-self.L:, :, stockslice, :]  # L*N*C
-        # transpose features
-        x = np.transpose(x, (1, 0, 2))  # N*L*C
-        # read labels
-        if self.sequence:
-            y = self.y[j - self.index_base:j + 1]
-            y = y.reshape(-1, *y.shape[2:])
-            if k != self.S - 1:
-                y = y[-(self.S - k - 1):, :]
-            y = y[-self.L:, stockslice]
-            y = y.transpose(1, 0)
-
-        # keep Lookback times
-        else:
-            y = self.y[j, k, stockslice]
-        
-        # read padding mask
-        pad_mask = np.full(self.N, False)
-        for d in range(j - self.index_base, j + 1):
-            pad_mask[self.p[d]] = True
-        pad_mask = torch.from_numpy(pad_mask).bool()
-        ignore_index = self.i[j]
-        y = torch.from_numpy(y).float()
-        pad_mask = torch.from_numpy(pad_mask).bool()
-        ignore_index = torch.from_numpy(ignore_index).bool()
-        ignore_index = ignore_index[k, stockslice]
-        
-        # clips
-        if self.clip is not None:
-            x = x.clamp(*self.clip)
-        
-        date = self.dates[j]
-        time = self.times[k]
-        weekday = datetime.date(int(date[:4]), int(date[4:6]), int(date[6:])).weekday()
-        time_info = torch.tensor([int(date[:4]), int(date[4:6]), int(date[6:]), weekday, int(time[:2]), int(time[2:4])])
-        time_info = time_info.unsqueeze(0).expand(self.N, 5)
-        
-        return x, y, pad_mask, ignore_index, time_info
-    
 class IntraMmapDataset(Dataset):
     """Dataset based on memory-mapped files"""
 
@@ -541,71 +549,72 @@ class IntraMmapDataset(Dataset):
         N: int,
         L: int,
         C: int,
-        start: int,
-        end: int,
+        start:int,
+        end:int,
         stocknum: int,
         x_keep: list = None,
         y_keep: list = None,
         clip: list = None,
         extending: bool = False,
-        sequence: bool = False,
-        time_range: list = None,
-        intraday: bool = False
+        sequence:bool=False,
+        time_range:list=None,
+        intraday=False,
+        **args
     ) -> None:
         self.data_path = data_path
         self.dates, self.times = dates, times
         self.N, self.L, self.C = N, L, C
         self.x_keep = list(range(len(times))) if x_keep is None else x_keep
         self.y_keep = list(range(len(times))) if y_keep is None else y_keep
-        self.time_range = self.y_keep if time_range is None else time_range
-        self.S = len(self.time_range)  # number of valid labels per day
-        self.clip_S = self.S - self.L + 1
-        self.time_range= list(range(len(self.times))) if time_range is None else time_range
-        assert self.L <= self.S
-        # the first valid date index
+        self.time_range=self.y_keep if time_range is None else time_range
+        self.S = len(self.time_range)   # number of valid labels per day
+        self.clip_S=self.S-self.L+1
+ 
+        assert self.L<=self.S
+#        the first valid date index
         self.clip = clip
         self.extending = extending
 
     def __len__(self) -> int:
-        return (len(self.dates)) * (1 if self.extending else self.clip_S)
-    def __getitem__(self, index: int) -> tuple:
-        # get index for date and time
-        j, k = index // self.clip_S, index % self.clip_S
-        x = np.memmap(
-            f"{self.data_path}x_{self.dates[j]}.dat",
-            dtype=np.float32,
-            mode="r",
-            shape=(len(self.times), self.N, self.C),
-        )[self.time_range]
 
+        return (len(self.dates)) * (1 if self.extending else self.clip_S)
+            
+
+    def __getitem__(self, index: int) -> tuple:
+
+        # get index for date and time
+
+        j, k = index // self.clip_S, index % self.clip_S
+        x=np.memmap(
+                f"{self.data_path}x_{self.dates[j]}.dat",
+                dtype=np.float32,
+                mode="r",
+                shape=(len(self.times), self.N, self.C),
+            )[self.time_range]
         # drop future times
         if k != self.clip_S - 1:
             x = x[: -(self.clip_S - k - 1), :, :]  # since x only has one more 240 than y
-
-        # keep Lookback times
+        # keep lookback times
         x = x[-self.L :]  # L*N*C
-
         # transpose features
         x = np.transpose(x, (1, 0, 2))  # N*L*C
-
-        # read Labels
+        # read labels
         y = np.memmap(
             f"{self.data_path}y_{self.dates[j]}.dat",
             dtype=np.float32,
             mode="r",
             shape=(len(self.times), self.N),
         )
-        y = y[self.time_range[k] + self.L - 1 :]  # N
-
+        # get corresponding labels
+        y = y[self.time_range[k]+self.L-1, :]  # N
         # read padding mask
         pad_mask = np.full(self.N, False)  # N
-        pad_mask |= np.memmap(
-            f"{self.data_path}p_{self.dates[j]}.dat",
-            dtype=bool,
-            mode="r",
-            shape=self.N,
-        )
-
+        pad_mask|= np.memmap(
+                f"{self.data_path}p_{self.dates[j]}.dat",
+                dtype=bool,
+                mode="r",
+                shape=self.N,
+            )
         # read ignored index
         ignore_index = np.memmap(
             f"{self.data_path}i_{self.dates[j]}.dat",
@@ -613,17 +622,113 @@ class IntraMmapDataset(Dataset):
             mode="r",
             shape=(len(self.times), self.N),
         )
-        ignore_index = ignore_index[self.time_range[k] + self.L - 1, :]  # N
-                # clip
+        # get corresponding ignored index
+        ignore_index = ignore_index[self.time_range[k]+self.L-1, :]  # N
+        # to tensor
+        x = torch.from_numpy(x).float()
+        y = torch.from_numpy(y).float()
+        pad_mask = torch.from_numpy(pad_mask).bool()
+        ignore_index = torch.from_numpy(ignore_index).bool()
+        # clip
         if self.clip is not None:
             x = x.clamp(*self.clip)
-        date = self.dates[j]
-        time = self.times[k]
-        weekday = datetime.date(int(date[:4]), int(date[4:6]), int(date[6:])).weekday()
-        time_info = torch.tensor((int(date[4:6]), int(date[6:]), weekday, int(time[:2]), int(time[2:4])))
-        time_info = time_info.unsqueeze(0).expand(self.N, 5)
+        date=self.dates[j]
+        time=self.times[k]
+        weekday=datetime.date(int(date[:4]),int(date[4:6]),int(date[6:])).weekday()
+        time_info=torch.tensor((int(date[4:6]),int(date[6:]),weekday,int(time[:2]),int(time[2:4])))
+        time_info=time_info.unsqueeze(0).expand(self.N,5)
+        return x, y, pad_mask, ignore_index,time_info
 
-        return x, y, pad_mask, ignore_index, time_info
-    
+class SequenceMmapDataset(Dataset):
+    """Dataset based on memory-mapped files"""
 
+    def __init__(
+        self,
+        data_path: str,
+        dates: list,
+        times: list,
+        N: int,
+        L: int,
+        C: int,
+        stocknum:int,
+        start:int,
+        end:int,
+        day:int=64,
+        x_keep: list = None,
+        y_keep: list = None,
+        clip: list = None,
+        extending: bool = False,
+        sequence:bool=False,
 
+        time_range:list=None,
+        
+    ) -> None:
+
+        self.data_path = data_path
+        self.dates, self.times = dates, times
+        self.N, self.L, self.C = N, L, C
+        self.stocknum=stocknum
+        self.groupnum=int(np.ceil(self.N/stocknum))
+        self.x_keep = list(range(len(times))) if x_keep is None else x_keep
+        self.y_keep = list(range(len(times))) if y_keep is None else y_keep
+        self.time_range=list(range(len(y_keep))) if time_range is None else time_range
+        self.S = len(self.time_range)  # number of valid labels per day
+        self.index_base = self.L // self.S + 1  # the first valid date index
+        self.clip = clip
+        self.extending = extending
+        self.sequence=sequence
+        
+#         self.x=np.memmap('/dfs/data/data/cat/x.dat',mode='r',dtype=np.float32,shape=(427,238,3759,170))[start:end,self.time_range]
+#         self.y=np.memmap('/dfs/data/data/cat/y.dat',mode='r',dtype=np.float32,shape=(427,238,3759))[start:end,self.time_range]
+#         self.i=np.memmap('/dfs/data/data/cat/i.dat',mode='r',dtype=np.bool_,shape=(427,238,3759))[start:end,self.time_range]
+#         self.p=np.memmap('/dfs/data/data/cat/p.dat',mode='r',dtype=np.bool_,shape=(427,3759))
+    def __len__(self) -> int:
+        # make sure that we start from a day with enough lookback data
+        return (len(self.dates) - self.index_base) * (1 if self.extending else self.S)*self.groupnum
+    def __getitem__(self, index: int) -> tuple:
+        # extending window
+       
+        # get index for date and time
+        time,group=index//self.groupnum,index%self.groupnum
+        j, k = time // self.S + self.index_base, time % self.S
+        x=np.memmap('/dfs/data/data/cat/x.dat',mode='r',dtype=np.float32,shape=(427,238,3759,170))[start:end,self.time_range][j-self.index_base:j+1]
+        x=x.reshape(-1,*x.shape[2:])
+        stockslice=range(min(group*self.stocknum,self.N-self.stocknum),min(self.N,(1+group)*self.stocknum))
+        if k != self.S - 1:
+            x = x[: -(self.S - k - 1), :, :]  # since x only has one more 240 than y
+        # keep lookback times
+        x = x[-self.L :,stockslice,:]  # L*N*C
+        # transpose features
+        x = np.transpose(x, (1, 0, 2))  # N*L*C
+        # read labels
+        if self.sequence:
+            y=np.memmap('/dfs/data/data/cat/y.dat',mode='r',dtype=np.float32,shape=(427,238,3759))[start:end,self.time_range][j-self.index_base:j+1]
+            y=y.reshape(-1,*y.shape[2:])
+            if k!=self.S-1:
+                y = y[: -(self.S - k - 1), :]
+#                 y=y[max(-(k+1),-self.L):,stockslice]
+            y=y[-self.L:,stockslice]
+            y=y.transpose(1,0)
+        # keep lookback times
+        else:
+            y=np.memmap('/dfs/data/data/cat/y.dat',mode='r',dtype=np.float32,shape=(427,238,3759))[start:end,self.time_range][j,k,stockslice]
+        # read padding mask
+        pad_mask = np.full(self.N, False)
+        for d in range(j-self.index_base,j+1):
+            pad_mask|=np.memmap('/dfs/data/data/cat/p.dat',mode='r',dtype=np.bool_,shape=(427,3759))[d]
+        ignore_index=np.memmap('/dfs/data/data/cat/i.dat',mode='r',dtype=np.bool_,shape=(427,238,3759))[start:end,self.time_range][j]
+        x = torch.from_numpy(x).float()
+        y = torch.from_numpy(y).float()
+        pad_mask = torch.from_numpy(pad_mask).bool()
+        ignore_index = torch.from_numpy(ignore_index).bool()
+        pad_mask=pad_mask[stockslice]
+        ignore_index=ignore_index[k,stockslice]
+        # clipS
+        if self.clip is not None:
+            x = x.clamp(*self.clip)
+        date=self.dates[j]
+        time=self.times[k]
+        weekday=datetime.date(int(date[:4]),int(date[4:6]),int(date[6:])).weekday()
+        time_info=torch.tensor((int(date[4:6]),int(date[6:]),weekday,int(time[:2]),int(time[2:4])))
+        time_info=time_info.unsqueeze(0).expand(self.N,5)
+        return x, y, pad_mask, ignore_index,time_info
