@@ -18,3 +18,5 @@ qlib 1min特征包含: "$change", "$close", "$factor", "$high", "$low", "$open",
 ![Vanilla-Transformer-epoch2-3.png](Logfiles%2FVanilla-Transformer-epoch2-3.png)
 ![Vanilla-Transformer-epoch2-4.png](Logfiles%2FVanilla-Transformer-epoch2-4.png)
 ![Vanilla-Transformer-epoch2-5.png](Logfiles%2FVanilla-Transformer-epoch2-5.png)
+
+![https://www.notion.so/baseline-1332027a6f308038829ac1e24c741b69]
